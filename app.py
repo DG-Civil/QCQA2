@@ -118,8 +118,9 @@ try:
 except ImportError:
     generate_high_res_dashboard = None
 
-st.set_page_config(page_title="Engineering QC/QA & Dashboard Tool", layout="wide")
+st.set_page_config(page_title="Engineering QC/QA & Dashboard Tool",page_icon="🧐", layout="wide")
 st.title("🏗️ Engineering Plan & Schedule QC/QA Audit Tool")
+
 
 
 # --- ADD THIS HELPER FUNCTION ---
