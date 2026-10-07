@@ -3,6 +3,107 @@ import tempfile
 import pandas as pd
 import streamlit as st
 
+import fitz
+from PIL import Image, ImageDraw
+from streamlit_image_coordinates import streamlit_image_coordinates
+
+
+def interactive_column_separator(uploaded_pdf, sample_page_num, session_key):
+    """Renders a PDF page and allows the user to click to define column boundaries as percentage fractions."""
+    if session_key not in st.session_state:
+        st.session_state[session_key] = []
+
+    # 1. Version tracking key to force component remounting when lines are cleared/deleted
+    version_key = f"{session_key}_version"
+    if version_key not in st.session_state:
+        st.session_state[version_key] = 0
+
+    # 2. State tracking key for click deduplication across Streamlit reruns
+    last_click_key = f"{session_key}_last_click"
+    if last_click_key not in st.session_state:
+        st.session_state[last_click_key] = None
+
+    st.markdown("**Visual Column Separator:** Click on the image below to add vertical column boundaries. These replace the need for 'Col Tolerance'.")
+
+    # 3. Status Indicator Badges
+    if st.session_state[session_key]:
+        st.success(f"🟢 Active: Using {len(st.session_state[session_key])} Visual Column Separator(s)")
+    else:
+        st.info("ℹ️ No visual lines set — Falling back to standard Column Tolerance")
+
+    col1, col2 = st.columns([3, 1])
+    current_version = st.session_state[version_key]
+    click_key = f"{session_key}_click_v{current_version}"
+
+    with col1:
+        # Load the specific page
+        doc = fitz.open(stream=uploaded_pdf.getvalue(), filetype="pdf")
+        page = doc[max(0, sample_page_num - 1)]
+
+        # Render image at standard 72 DPI
+        pix = page.get_pixmap(dpi=72)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+        # Scale down for the UI view
+        DISPLAY_WIDTH = 900 
+        scale_ratio = DISPLAY_WIDTH / float(pix.width)
+        display_height = int(pix.height * scale_ratio)
+        img = img.resize((DISPLAY_WIDTH, display_height))
+
+        # Draw existing separator lines using percentage fractions
+        draw = ImageDraw.Draw(img)
+        for pct in st.session_state[session_key]:
+            # Normalize legacy point values if present
+            pct_val = pct / page.rect.width if pct > 1.0 else pct
+            display_x = pct_val * DISPLAY_WIDTH
+            draw.line([(display_x, 0), (display_x, img.height)], fill="red", width=3)
+
+        # Display clickable image using a versioned key
+        coords = streamlit_image_coordinates(img, key=click_key)
+
+        # 4. Deduplication Check: Only process if coords exist AND differ from previous click state
+        if coords and coords != st.session_state[last_click_key]:
+            st.session_state[last_click_key] = coords  # Store click to prevent rerun ghosting
+            click_pct = coords['x'] / float(DISPLAY_WIDTH)
+
+            # Use 1% (0.01) threshold to eliminate duplicate clicks nearby
+            if not any(abs(click_pct - ex) < 0.01 for ex in st.session_state[session_key]):
+                st.session_state[session_key].append(click_pct)
+                st.session_state[session_key].sort()
+                st.rerun()
+
+    with col2:
+        st.write("### Active Boundaries")
+        
+        # 5. Individual Line Removal Buttons
+        lines_to_remove = []
+        for idx, pct in enumerate(st.session_state[session_key]):
+            pct_val = pct / page.rect.width if pct > 1.0 else pct
+            lbl_col, btn_col = st.columns([3, 1])
+            lbl_col.write(f"Line {idx + 1}: **{pct_val * 100:.1f}%**")
+            if btn_col.button("❌", key=f"del_{session_key}_{idx}_v{current_version}"):
+                lines_to_remove.append(pct)
+
+        # Apply single line removal and increment version counter
+        if lines_to_remove:
+            for pct_to_rem in lines_to_remove:
+                st.session_state[session_key].remove(pct_to_rem)
+            st.session_state[version_key] += 1
+            st.session_state[last_click_key] = None
+            st.rerun()
+
+        st.markdown("---")
+
+        # Global Clear All and increment version counter
+        if st.button("🗑️ Clear All Lines", key=f"clear_{session_key}_v{current_version}"):
+            st.session_state[session_key] = []
+            st.session_state[version_key] += 1
+            st.session_state[last_click_key] = None
+            st.rerun()
+
+    return st.session_state[session_key]
+
+
 # Custom backend helper import
 from qc_helpers import (
     process_and_compare_pdfs,
@@ -126,6 +227,15 @@ with tab_da:
     st.divider()
     st.header("Plan Comparison Setup")
     uploaded_da_pdf = st.file_uploader("Upload Drainage Plan PDF", type=['pdf'], key="da_pdf_uploader")
+    
+    # --- ADD THE VISUAL SEPARATOR HERE ---
+    da_visual_splits = []
+    if uploaded_da_pdf:
+        # Let user pick which table page to preview
+        preview_page = st.number_input("Sample Table Page for Column Setup", value=22, min_value=1, key="da_preview_page")
+        da_visual_splits = interactive_column_separator(uploaded_da_pdf, preview_page, "da_x_splits")
+    # ------------------------------------    
+
     da_structure_pattern = st.text_input("Structure Regex Pattern", value=r"\b[A-Za-z]+-[A-Za-z]+-\d+\b", key="da_structure_pattern")
     
     da_col1, da_col2, da_col3, da_col4 = st.columns(4)
@@ -196,6 +306,7 @@ with tab_da:
                         margin_top_in=da_margin_top, margin_bottom_in=da_margin_bottom,
                         row_tolerance=da_row_tol, col_tolerance=da_col_tol, search_width_mult=da_search_w, search_height_mult=da_search_h,
                         skip_header_rows=int(da_skip_header_rows), structure_pattern=da_structure_pattern,
+                        x_separators=da_visual_splits,
                         output_excel=out_excel_path, marked_pdf_output=out_pdf_path
                     )
                     st.session_state.da_excel_data = open(out_excel_path, "rb").read()
@@ -243,6 +354,15 @@ with tab_plan:
     
     st.divider()
     uploaded_pdf = st.file_uploader("Upload Plan PDF", type=['pdf'], key="plan_pdf_uploader")
+    
+    # --- ADD THE VISUAL SEPARATOR HERE ---
+    plan_visual_splits = []
+    if uploaded_pdf:
+        # Let user pick which table page to preview
+        preview_page = st.number_input("Sample Table Page for Column Setup", value=24, min_value=1, key="plan_preview_page")
+        plan_visual_splits = interactive_column_separator(uploaded_pdf, preview_page, "plan_x_splits")
+    # ------------------------------------    
+
     structure_pattern = st.text_input("Structure Regex Pattern", value=r"\b[A-Za-z]{2}-[A-Za-z](?![PCp c])[A-Za-z]-\d{1,4}\b", key="plan_regex")
 
     p_col1, p_col2, p_col3, p_col4 = st.columns(4)
@@ -312,6 +432,7 @@ with tab_plan:
                         margin_top_in=margin_top, margin_bottom_in=margin_bottom,
                         row_tolerance=row_tol, col_tolerance=col_tol, search_width_mult=search_w, search_height_mult=search_h,
                         skip_header_rows=int(skip_header_rows), structure_pattern=structure_pattern,
+                        x_separators=plan_visual_splits,
                         output_excel=out_xl, marked_pdf_output=out_pdf
                     )
                     st.session_state.plan_excel = open(out_xl, "rb").read()
@@ -350,6 +471,16 @@ with tab_profile:
 
     st.divider()
     uploaded_prof_pdf = st.file_uploader("Upload Profile PDF", type=['pdf'], key="prof_pdf_uploader")
+    
+    # --- ADD THE VISUAL SEPARATOR HERE ---
+    profile_visual_splits = []
+    if uploaded_prof_pdf:
+        # Let user pick which table page to preview
+        preview_page = st.number_input("Sample Table Page for Column Setup", value=24, min_value=1, key="profile_preview_page")
+        profile_visual_splits = interactive_column_separator(uploaded_prof_pdf, preview_page, "profile_visual_splits")
+    # ------------------------------------    
+
+
     prof_structure_pattern = st.text_input("Profile Structure Regex Pattern", value=r"\b[A-Za-z]{2}-[A-Za-z]P-[A-Za-z0-9-]+\b", key="prof_regex")
 
     pr_col1, pr_col2, pr_col3, pr_col4 = st.columns(4)
@@ -417,6 +548,7 @@ with tab_profile:
                         row_tolerance=prof_row_tol, col_tolerance=prof_col_tol,
                         search_width_mult=prof_search_w, search_height_mult=prof_search_h,
                         skip_header_rows=int(prof_skip_header), structure_pattern=prof_structure_pattern,
+                        x_separators=profile_visual_splits,
                         output_excel=out_xl, marked_pdf_output=out_pdf
                     )
                     st.session_state.prof_excel = open(out_xl, "rb").read()
@@ -463,6 +595,15 @@ with tab_top:
     key="top_orient_toggle"
     )
     uploaded_top_pdf = st.file_uploader("Upload Plan/Profile PDF for Elevation", type=['pdf'], key="top_pdf_uploader")
+    
+    # --- ADD THE VISUAL SEPARATOR HERE ---
+    top_ele_visual_splits = []
+    if uploaded_top_pdf:
+        # Let user pick which table page to preview
+        preview_page = st.number_input("Sample Table Page for Column Setup", value=24, min_value=1, key="top_ele_preview_page")
+        top_ele_visual_splits = interactive_column_separator(uploaded_top_pdf, preview_page, "top_ele_visual_splits")
+    # ------------------------------------    
+
     top_structure_pattern = st.text_input("Structure Regex Pattern", value=r"\b[A-Za-z]{2}-[A-Za-z](?![PCp c])[A-Za-z]-\d{1,4}\b", key="top_regex")
 
     tp_col1, tp_col2, tp_col3, tp_col4 = st.columns(4)
@@ -550,6 +691,7 @@ with tab_top:
                         skip_header_rows=int(top_skip_header),
                         structure_pattern=top_structure_pattern,
                         orientation="vertical_b2t" if "Vertical" in top_orientation else "horizontal",
+                        x_separators=top_ele_visual_splits,
                         output_excel=out_xl, marked_pdf_output=out_pdf
                     )
                     st.session_state.top_excel = open(out_xl, "rb").read()
@@ -603,6 +745,15 @@ with tab_ditch:
         key="ditch_orient_toggle"
     )
     uploaded_ditch_pdf = st.file_uploader("Upload Ditch Plan PDF", type=['pdf'], key="ditch_pdf_uploader")
+    
+    # --- ADD THE VISUAL SEPARATOR HERE ---
+    ditch_visual_splits = []
+    if uploaded_ditch_pdf:
+        # Let user pick which table page to preview
+        preview_page = st.number_input("Sample Table Page for Column Setup", value=24, min_value=1, key="ditch_preview_page")
+        ditch_visual_splits = interactive_column_separator(uploaded_ditch_pdf, preview_page, "ditch_visual_splits")
+    # ------------------------------------    
+
     ditch_structure_pattern = st.text_input("Structure Regex Pattern", value=r"\b[A-Za-z]{2}-[A-Za-z]{2}-\d{1,4}\b", key="ditch_regex")
 
     dt_col1, dt_col2, dt_col3, dt_col4 = st.columns(4)
@@ -681,6 +832,7 @@ with tab_ditch:
                         skip_header_rows=int(ditch_skip_header),
                         structure_pattern=ditch_structure_pattern,
                         orientation="vertical_b2t" if "Vertical" in ditch_orientation else "horizontal",
+                        x_separators=ditch_visual_splits,
                         output_excel=out_xl, marked_pdf_output=out_pdf
                     )
                     st.session_state.ditch_excel = open(out_xl, "rb").read()

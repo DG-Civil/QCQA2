@@ -293,9 +293,10 @@ def group_blocks_into_vertical_lines(blocks, x_tolerance=5):
 
 
 
-def group_ocr_into_table(words, row_tolerance=5, col_tolerance=20, skip_header_rows=3):
+def group_ocr_into_table(words, row_tolerance=5, col_tolerance=20, skip_header_rows=3, x_separators=None, page_width=None):
     if not words:
         return pd.DataFrame(), []
+        
     items = []
     for w in words:
         text = sanitize_excel_text(w[4])
@@ -308,6 +309,7 @@ def group_ocr_into_table(words, row_tolerance=5, col_tolerance=20, skip_header_r
     if not items:
         return pd.DataFrame(), []
 
+    # 1. Y-axis Row Grouping
     items.sort(key=lambda item: item['y_center'])
     rows, current_row, current_y = [], [], None
 
@@ -323,36 +325,85 @@ def group_ocr_into_table(words, row_tolerance=5, col_tolerance=20, skip_header_r
     if current_row:
         rows.append(current_row)
 
-    col_centers = []
-    for x in sorted([item['x_center'] for item in items]):
-        if not col_centers:
-            col_centers.append(x)
-        else:
-            matched = False
-            for idx, c in enumerate(col_centers):
-                if abs(x - c) <= col_tolerance:
-                    col_centers[idx], matched = (c + x) / 2.0, True
-                    break
-            if not matched:
-                col_centers.append(x)
-    col_centers.sort()
+    for row in rows:
+        row.sort(key=lambda i: i['x_center'])
 
     grid_data, row_bboxes_pt = [], []
-    for row in rows:
-        row_dict = {f"Col_{i+1}": "" for i in range(len(col_centers))}
-        rx0, ry0, rx1, ry1 = min(i['x0'] for i in row), min(i['y0'] for i in row), max(i['x1'] for i in row), max(i['y1'] for i in row)
-        for item in row:
-            best_col_idx = min(range(len(col_centers)), key=lambda i: abs(item['x_center'] - col_centers[i]))
-            col_key = f"Col_{best_col_idx + 1}"
-            row_dict[col_key] = (row_dict[col_key] + " " + item['text']).strip() if row_dict[col_key] else item['text']
-        grid_data.append(row_dict)
-        row_bboxes_pt.append([rx0, ry0, rx1, ry1])
 
+    # 2. X-axis Column Grouping
+    if x_separators and len(x_separators) > 0:
+        # Determine native reference page width in PDF points
+        ref_width = page_width if page_width else max(item['x1'] for item in items)
+        
+        # Convert percentages (0.0-1.0 or 0-100%) into native PDF points
+        converted_separators = []
+        for sep in x_separators:
+            if 0.0 <= sep <= 1.0:
+                converted_separators.append(sep * ref_width)
+            elif 1.0 < sep <= 100.0 and ref_width > 100.0:
+                converted_separators.append((sep / 100.0) * ref_width)
+            else:
+                converted_separators.append(sep)
+
+        boundaries = [0] + sorted(converted_separators) + [float('inf')]
+        
+        for row in rows:
+            if not row: continue
+            row_dict = {f"Col_{i+1}": "" for i in range(len(boundaries) - 1)}
+            rx0, ry0, rx1, ry1 = min(i['x0'] for i in row), min(i['y0'] for i in row), max(i['x1'] for i in row), max(i['y1'] for i in row)
+            
+            for item in row:
+                for col_idx in range(len(boundaries) - 1):
+                    if boundaries[col_idx] <= item['x_center'] < boundaries[col_idx + 1]:
+                        col_key = f"Col_{col_idx + 1}"
+                        row_dict[col_key] = (row_dict[col_key] + " " + item['text']).strip() if row_dict[col_key] else item['text']
+                        break
+                        
+            grid_data.append(row_dict)
+            row_bboxes_pt.append([rx0, ry0, rx1, ry1])
+
+    else:
+        # FALLBACK MODE: Dynamic col_tolerance grouping
+        col_centers = []
+        for x in sorted([item['x_center'] for item in items]):
+            if not col_centers:
+                col_centers.append(x)
+            else:
+                matched = False
+                for idx, c in enumerate(col_centers):
+                    if abs(x - c) <= col_tolerance:
+                        col_centers[idx], matched = (c + x) / 2.0, True
+                        break
+                if not matched:
+                    col_centers.append(x)
+        col_centers.sort()
+
+        for row in rows:
+            if not row: continue
+            row_dict = {f"Col_{i+1}": "" for i in range(len(col_centers))}
+            rx0, ry0, rx1, ry1 = min(i['x0'] for i in row), min(i['y0'] for i in row), max(i['x1'] for i in row), max(i['y1'] for i in row)
+            for item in row:
+                best_col_idx = min(range(len(col_centers)), key=lambda i: abs(item['x_center'] - col_centers[i]))
+                col_key = f"Col_{best_col_idx + 1}"
+                row_dict[col_key] = (row_dict[col_key] + " " + item['text']).strip() if row_dict[col_key] else item['text']
+            grid_data.append(row_dict)
+            row_bboxes_pt.append([rx0, ry0, rx1, ry1])
+
+    # 3. Final DataFrame Formatting
     df = pd.DataFrame(grid_data)
     if skip_header_rows > 0 and len(df) > skip_header_rows:
         df = df.iloc[skip_header_rows:].reset_index(drop=True)
         row_bboxes_pt = row_bboxes_pt[skip_header_rows:]
+
+    # PRUNE EMPTY BOUNDARY COLUMNS & RE-INDEX POPULATED COLUMNS
+    if not df.empty and x_separators and len(x_separators) > 0:
+        non_empty_cols = [c for c in df.columns if df[c].astype(str).str.strip().ne("").any()]
+        if non_empty_cols:
+            df = df[non_empty_cols]
+            df.columns = [f"Col_{i+1}" for i in range(len(df.columns))]
+        
     return df, row_bboxes_pt
+
 
 def draw_translucent_highlighter(page, bbox_pts, color_rgb, fill_opacity=0.35):
     rect = fitz.Rect(bbox_pts[0], bbox_pts[1], bbox_pts[2], bbox_pts[3])
@@ -444,6 +495,7 @@ def process_and_compare_pdfs(
     margin_left_in=1.5, margin_right_in=2.5, margin_top_in=0.5, margin_bottom_in=0.5,
     row_tolerance=5, col_tolerance=20, search_width_mult=3.0, search_height_mult=1.25,
     skip_header_rows=3, structure_pattern=r"\b[A-Za-z]{2}-[A-Za-z](?![PCp c])[A-Za-z]-\d{1,4}\b",
+    x_separators=None,
     output_excel="comparison_summary.xlsx", marked_pdf_output="marked_output.pdf"
 ):
     if baseline_aliases is None:
@@ -486,7 +538,7 @@ def process_and_compare_pdfs(
         page = doc[p_num - 1]
         crop_rect = fitz.Rect(margin_left_in * 72.0, margin_top_in * 72.0, page.rect.width - (margin_right_in * 72.0), page.rect.height - (margin_bottom_in * 72.0))
         words = page.get_text("words", clip=crop_rect)
-        df_table, row_bboxes = group_ocr_into_table(words, row_tolerance, col_tolerance, skip_header_rows)
+        df_table, row_bboxes = group_ocr_into_table(words, row_tolerance, col_tolerance, skip_header_rows, x_separators=x_separators, page_width=page.rect.width)
 
         for idx, row in df_table.iterrows():
             target_col = next((c['Table_Column'] for c in dynamic_config if c['Variable'] == target_var), None)
@@ -598,6 +650,7 @@ def process_and_compare_ditch_layout(
     row_tolerance=5, col_tolerance=20, search_width_mult=2.5, search_height_mult=1.15,
     skip_header_rows=3, structure_pattern=r"\b[A-Za-z]{2}-[A-Za-z]{2}-\d{1,4}\b",
     orientation="horizontal",
+    x_separators=None,
     output_excel="ditch_layout_comparison.xlsx", marked_pdf_output="marked_ditch_output.pdf"
 ):
     if baseline_aliases is None:
@@ -672,7 +725,7 @@ def process_and_compare_ditch_layout(
         crop_rect = fitz.Rect(crop_x0, crop_y0, crop_x1, crop_y1)
 
         words = page.get_text("words", clip=crop_rect)
-        df_table, row_bboxes_pt = group_ocr_into_table(words, row_tolerance=row_tolerance, col_tolerance=col_tolerance, skip_header_rows=skip_header_rows)
+        df_table, row_bboxes_pt = group_ocr_into_table(words, row_tolerance=row_tolerance, col_tolerance=col_tolerance, skip_header_rows=skip_header_rows, x_separators=x_separators, page_width=page.rect.width)
         
         for idx, row in df_table.iterrows():
             name_val = row.get(col_name_key, "")
@@ -802,6 +855,7 @@ def process_and_compare_top_elevations(
     row_tolerance=5, col_tolerance=20, search_width_mult=2.0, search_height_mult=1.25,
     skip_header_rows=3, structure_pattern=r"\b[A-Za-z]{2}-[A-Za-z]{2}-\d{1,4}\b",
     orientation="horizontal",
+    x_separators=None,
     output_excel="profile_elevation_comparison.xlsx", marked_pdf_output="marked_profile_output.pdf"
 ):
     
@@ -872,7 +926,7 @@ def process_and_compare_top_elevations(
         crop_rect = fitz.Rect(crop_x0, crop_y0, crop_x1, crop_y1)
 
         words = page.get_text("words", clip=crop_rect)
-        df_table, row_bboxes_pt = group_ocr_into_table(words, row_tolerance=row_tolerance, col_tolerance=col_tolerance, skip_header_rows=skip_header_rows)
+        df_table, row_bboxes_pt = group_ocr_into_table(words, row_tolerance=row_tolerance, col_tolerance=col_tolerance, skip_header_rows=skip_header_rows, x_separators=x_separators, page_width=page.rect.width)
 
         for idx, row in df_table.iterrows():
             name_val = row.get(col_name_key, "")
